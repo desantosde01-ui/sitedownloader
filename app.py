@@ -67,6 +67,10 @@ def cleanup_abandoned_sessions():
 cleanup_thread = threading.Thread(target=cleanup_abandoned_sessions, daemon=True)
 cleanup_thread.start()
 
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok'}), 200
+
 @app.route('/')
 def index():
     return render_template('index.html')

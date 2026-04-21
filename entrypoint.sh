@@ -1,12 +1,11 @@
 #!/bin/bash
 set -e
 
-echo "Starting gunicorn on port 8080..."
+PORT=${PORT:-8080}
+echo "Starting gunicorn on port ${PORT}..."
 
-# Start gunicorn with fixed port 8080
-# Railway will automatically proxy external traffic to this port
 exec gunicorn app:app \
-    --bind "0.0.0.0:8080" \
+    --bind "0.0.0.0:${PORT}" \
     --workers 1 \
     --threads 2 \
     --timeout 300 \
