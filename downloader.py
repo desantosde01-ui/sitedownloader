@@ -23,6 +23,7 @@ class WebsiteDownloader:
         self.base_url = url
         self.session = None  # Will be set with cookies from browser
         self.log_callback = log_callback or (lambda msg: print(msg))
+        self._canvas_captures = {}  # index -> {'path': str, attrs: dict}
         
         if os.path.exists(output_dir):
             shutil.rmtree(output_dir)
@@ -211,6 +212,87 @@ class WebsiteDownloader:
         css_content = import_pattern.sub(import_replacer, css_content)
         css_content = self._rewrite_css_urls(css_content, css_url)
         return css_content
+
+    def _capture_canvas_elements(self, page):
+        """Screenshot every canvas while Playwright still has the page open.
+        Stores results in self._canvas_captures keyed by canvas index."""
+        canvases = page.query_selector_all('canvas')
+        if not canvases:
+            return
+
+        self.log(f"🎨 Capturando {len(canvases)} elemento(s) canvas como imagem...")
+        captured = 0
+
+        for i, canvas in enumerate(canvases):
+            try:
+                # Bring canvas into view so the GPU has rendered it
+                canvas.scroll_into_view_if_needed()
+                page.wait_for_timeout(600)
+
+                # Playwright screenshots the composited pixel output — works for WebGL too
+                png_bytes = canvas.screenshot(type='png')
+
+                # Skip blank/tiny captures (< 500 bytes is almost certainly empty)
+                if not png_bytes or len(png_bytes) < 500:
+                    continue
+
+                filename = f"canvas_{i:03d}_{hashlib.md5(png_bytes[:200]).hexdigest()[:8]}.png"
+                filepath = os.path.join(self.assets_dir, filename)
+                with open(filepath, 'wb') as f:
+                    f.write(png_bytes)
+
+                self._canvas_captures[i] = {
+                    'path': f"assets/{filename}",
+                    'id': canvas.get_attribute('id') or '',
+                    'class': canvas.get_attribute('class') or '',
+                    'width': canvas.get_attribute('width') or '',
+                    'height': canvas.get_attribute('height') or '',
+                    'style': canvas.get_attribute('style') or '',
+                }
+                captured += 1
+                self.log(f"   ✅ Canvas {i} capturado ({len(png_bytes) // 1024} KB)")
+
+            except Exception as e:
+                self.log(f"   ⚠️ Canvas {i} falhou: {e}")
+
+        self.log(f"🖼️ {captured}/{len(canvases)} canvas(es) capturados com sucesso")
+
+    def _replace_canvas_with_images(self, soup):
+        """Replace captured canvas elements with static <img> tags in the soup."""
+        if not self._canvas_captures:
+            return
+
+        canvases = soup.find_all('canvas')
+        replaced = 0
+        for i, canvas in enumerate(canvases):
+            if i not in self._canvas_captures:
+                continue
+            info = self._canvas_captures[i]
+            img = soup.new_tag('img')
+            img['src'] = info['path']
+            img['alt'] = ''
+            img['data-canvas-capture'] = 'true'
+
+            # Preserve sizing so layout doesn't shift
+            style_parts = ['display:block']
+            if info['style']:
+                style_parts.append(info['style'])
+            # Force the img to fill the same space as the canvas
+            style_parts.append('width:100%;height:auto;max-width:100%')
+            img['style'] = ';'.join(style_parts)
+
+            if info['width']:
+                img['width'] = info['width']
+            if info['height']:
+                img['height'] = info['height']
+            if info['class']:
+                img['class'] = info['class']
+
+            canvas.replace_with(img)
+            replaced += 1
+
+        if replaced:
+            self.log(f"🔄 {replaced} canvas(es) substituídos por imagens estáticas")
 
     def _detect_nextjs(self, soup):
         """Detect if page is built with Next.js even without #__next"""
@@ -520,10 +602,11 @@ class WebsiteDownloader:
             browser = p.chromium.launch(
                 headless=True,
                 args=[
-                    '--disable-dev-shm-usage',  # Overcome limited resource problems
-                    '--no-sandbox',  # Required for Docker
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox',
                     '--disable-setuid-sandbox',
-                    '--disable-gpu',
+                    # '--disable-gpu' intentionally omitted — WebGL/canvas requires GPU or SwiftShader
+                    '--use-gl=swiftshader',  # Software WebGL renderer (works headless without real GPU)
                     '--disable-extensions',
                     '--disable-background-networking',
                     '--disable-default-apps',
@@ -616,7 +699,10 @@ class WebsiteDownloader:
                 html_content = page.content()
             
             self.log(f"📦 Capturados {len(self.network_resources)} recursos de rede")
-            
+
+            # Capture canvas/WebGL elements as static images before closing browser
+            self._capture_canvas_elements(page)
+
             browser.close()
         
         # Process HTML
@@ -625,7 +711,10 @@ class WebsiteDownloader:
         
         # Fix scroll-blocking issues for offline viewing
         self._fix_scroll_blocking(soup)
-        
+
+        # Replace canvas elements with captured screenshots
+        self._replace_canvas_with_images(soup)
+
         # Remove any remaining iframes that are wrappers (like Aura preview frames)
         for iframe in soup.find_all('iframe'):
             # Keep only essential iframes (videos, maps, etc.)
