@@ -317,11 +317,15 @@ class WebsiteDownloader:
         for i, canvas in enumerate(canvases):
             try:
                 # Bring canvas into view so the GPU has rendered it
-                canvas.scroll_into_view_if_needed()
-                page.wait_for_timeout(600)
+                try:
+                    canvas.scroll_into_view_if_needed(timeout=5000)
+                except Exception:
+                    pass  # Continue even if scroll fails
+                page.wait_for_timeout(400)
 
                 # Playwright screenshots the composited pixel output — works for WebGL too
-                png_bytes = canvas.screenshot(type='png')
+                # Short timeout: if WebGL isn't ready in 6s, skip this canvas
+                png_bytes = canvas.screenshot(type='png', timeout=6000)
 
                 # Skip blank/tiny captures (< 500 bytes is almost certainly empty)
                 if not png_bytes or len(png_bytes) < 500:
@@ -344,7 +348,8 @@ class WebsiteDownloader:
                 self.log(f"   ✅ Canvas {i} capturado ({len(png_bytes) // 1024} KB)")
 
             except Exception as e:
-                self.log(f"   ⚠️ Canvas {i} falhou: {e}")
+                err = str(e)[:60]
+                self.log(f"   ⚠️ Canvas {i} ignorado: {err}")
 
         self.log(f"🖼️ {captured}/{len(canvases)} canvas(es) capturados com sucesso")
 
