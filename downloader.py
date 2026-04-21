@@ -24,6 +24,7 @@ class WebsiteDownloader:
         self.session = None  # Will be set with cookies from browser
         self.log_callback = log_callback or (lambda msg: print(msg))
         self._canvas_captures = {}  # index -> {'path': str, attrs: dict}
+        self._computed_styles = {}  # data-cc id -> inline style string
         
         if os.path.exists(output_dir):
             shutil.rmtree(output_dir)
@@ -212,6 +213,96 @@ class WebsiteDownloader:
         css_content = import_pattern.sub(import_replacer, css_content)
         css_content = self._rewrite_css_urls(css_content, css_url)
         return css_content
+
+    def _capture_computed_styles(self, page):
+        """Run in the live browser after JS has executed.
+        Tags every element with data-cc and records its key computed styles.
+        Only captures properties that JS commonly manipulates so we don't
+        bloat the HTML with trivial/default values."""
+        self.log("💅 Capturando estilos computados...")
+
+        style_map = page.evaluate("""() => {
+            const LAYOUT_PROPS = [
+                'position','top','right','bottom','left','z-index',
+                'display','overflow','overflow-x','overflow-y',
+                'transform','will-change',
+                'flex-direction','flex-wrap','align-items','justify-content',
+                'align-self','justify-self','flex','flex-grow','flex-shrink','flex-basis',
+                'grid-template-columns','grid-template-rows','grid-column','grid-row','gap',
+                'width','height','max-width','max-height','min-width','min-height',
+                'float','clear','vertical-align',
+                'opacity','visibility','clip-path','backdrop-filter','filter',
+                'pointer-events','cursor','user-select'
+            ];
+            const VISUAL_PROPS = [
+                'background','background-color','background-image',
+                'border','border-top','border-right','border-bottom','border-left',
+                'border-radius','box-shadow','outline','color'
+            ];
+            const SKIP_TAGS = new Set(['SCRIPT','STYLE','NOSCRIPT','META','LINK','TITLE','HEAD','HTML','BODY']);
+            // Property+value pairs that mean "nothing set by JS"
+            const DEFAULT_PAIRS = new Set([
+                'position:static','opacity:1','visibility:visible',
+                'overflow:visible','overflow-x:visible','overflow-y:visible',
+                'pointer-events:auto','cursor:auto','user-select:auto',
+                'display:block','display:inline','display:inline-block',
+                'float:none','clear:none','will-change:auto',
+                'transform:none','filter:none','backdrop-filter:none','clip-path:none',
+                'z-index:auto'
+            ]);
+
+            const styleMap = {};
+            let count = 0;
+
+            document.querySelectorAll('*').forEach(el => {
+                if (SKIP_TAGS.has(el.tagName)) return;
+
+                const inNav = !!el.closest(
+                    'nav, header, [role="navigation"], [role="menu"], ' +
+                    '[role="dialog"], [role="tooltip"], [role="listbox"]'
+                );
+                const props = inNav ? [...LAYOUT_PROPS, ...VISUAL_PROPS] : LAYOUT_PROPS;
+                const computed = window.getComputedStyle(el);
+                const parts = [];
+
+                for (const prop of props) {
+                    const val = (computed.getPropertyValue(prop) || '').trim();
+                    if (!val || val === 'none' || val === 'auto' || val === 'normal'
+                            || val === 'initial' || val === '0px'
+                            || DEFAULT_PAIRS.has(prop + ':' + val)) continue;
+                    parts.push(prop + ':' + val);
+                }
+
+                if (parts.length > 0) {
+                    const id = 'cc' + (count++);
+                    el.setAttribute('data-cc', id);
+                    styleMap[id] = parts.join(';');
+                }
+            });
+
+            return styleMap;
+        }""")
+
+        self._computed_styles = style_map or {}
+        self.log(f"   ✅ Estilos computados de {len(self._computed_styles)} elementos capturados")
+
+    def _apply_computed_styles(self, soup):
+        """Apply captured computed styles as inline styles on every tagged element."""
+        if not self._computed_styles:
+            return
+
+        applied = 0
+        for elem in soup.find_all(attrs={'data-cc': True}):
+            cc_id = elem.get('data-cc')
+            if cc_id in self._computed_styles:
+                computed = self._computed_styles[cc_id]
+                existing = elem.get('style', '').strip().rstrip(';')
+                # Computed styles go first; existing inline styles win (higher specificity)
+                elem['style'] = computed + (';' + existing if existing else '')
+                applied += 1
+            del elem['data-cc']
+
+        self.log(f"💅 Estilos computados aplicados em {applied} elementos")
 
     def _capture_canvas_elements(self, page):
         """Screenshot every canvas while Playwright still has the page open.
@@ -691,13 +782,17 @@ class WebsiteDownloader:
             for cookie in cookies:
                 self.session.cookies.set(cookie['name'], cookie['value'], domain=cookie.get('domain', ''))
             
+            # Capture computed styles BEFORE page.content() so data-cc attrs are in the HTML
+            if not is_iframe:
+                self._capture_computed_styles(page)
+
             # Get final HTML - use iframe content if detected
             if is_iframe and iframe_content:
                 html_content = iframe_content
                 self.log("✨ Usando conteúdo extraído do iframe")
             else:
                 html_content = page.content()
-            
+
             self.log(f"📦 Capturados {len(self.network_resources)} recursos de rede")
 
             # Capture canvas/WebGL elements as static images before closing browser
@@ -714,6 +809,9 @@ class WebsiteDownloader:
 
         # Replace canvas elements with captured screenshots
         self._replace_canvas_with_images(soup)
+
+        # Apply computed styles captured from live browser
+        self._apply_computed_styles(soup)
 
         # Remove any remaining iframes that are wrappers (like Aura preview frames)
         for iframe in soup.find_all('iframe'):
